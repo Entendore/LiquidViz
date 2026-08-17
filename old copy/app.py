@@ -1,10 +1,11 @@
 import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QColor, QPalette, Qt
-from ui import MainWindow
+from ui import LiquidWindow
 
 def main():
     app = QApplication(sys.argv)
+    
     app.setStyle("Fusion")
     palette = QPalette()
     palette.setColor(QPalette.Window, QColor(30, 30, 30))
@@ -21,7 +22,7 @@ def main():
     palette.setColor(QPalette.HighlightedText, Qt.black)
     app.setPalette(palette)
 
-    window = MainWindow()
+    window = LiquidWindow()
     window.show()
     sys.exit(app.exec())
 

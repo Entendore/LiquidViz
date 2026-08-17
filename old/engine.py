@@ -1,109 +1,200 @@
-import cupy as cp
+# engine.py - GPU fluid simulation engine (numba.cuda backend)
+#
+# CRITICAL FIX: Original used cupy arrays with numba.cuda kernels —
+# fundamentally incompatible.  Now uses numba.cuda device arrays throughout.
+#
+# CRITICAL FIX: Pressure solver no longer allocates a new buffer every frame.
+# Uses pre-allocated double-buffer (self.p, self.p_new) with SOR for
+# faster convergence.
+
+import math
+
+from numba import cuda
 import numpy as np
-from config import SIM_W, SIM_H, PALETTES, SPEED_OF_WAVE, DAMPING, RAIN_RATE
+from config import (
+    SIM_GRID_SIZE, ITERATIONS, DISSIPATION, VELOCITY_DISSIPATION,
+    VORTICITY_STRENGTH, SOR_OMEGA, MOUSE_FORCE, MOUSE_DENSITY, MOUSE_RADIUS,
+    MOUSE_COLOR,
+)
+import kernels
 
-class LiquidEngine:
-    def __init__(self):
-        # Dimensions (renamed to avoid conflict with height map)
-        self.width, self.height = SIM_W, SIM_H
-        
-        # State:
-        # h_map: Height map (amount of water)
-        # u, v: Velocity fields
-        self.h_map = cp.zeros((self.height, self.width), dtype=np.float32)
-        self.u = cp.zeros((self.height, self.width), dtype=np.float32)
-        self.v = cp.zeros((self.height, self.width), dtype=np.float32)
-        
-        self.palette_idx = 0
-        self._build_lut()
-        
-    def _build_lut(self):
-        # Build color LUT on CPU, upload to GPU
-        lut = []
-        for i in range(256):
-            v = i / 255.0
-            r, g, b = PALETTES[self.palette_idx][1](v)
-            lut.append((max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))))
-        self.lut = cp.array(lut, dtype=np.uint8)
-    
-    def set_palette(self, idx):
-        self.palette_idx = idx % len(PALETTES)
-        self._build_lut()
 
-    def seed_solid(self):
-        # Clear and create a big block of water
-        self.h_map.fill(0)
-        self.u.fill(0)
-        self.v.fill(0)
-        cx, cy = self.width // 2, self.height // 2
-        self.h_map[cy-40:cy+40, cx-60:cx+60] = 1.0
+class FluidEngine:
+    """GPU-accelerated 2D fluid solver with RGB density transport."""
 
-    def seed_wave(self):
-        self.h_map.fill(0)
-        # Create a line of water
-        self.h_map[self.height//2-10:self.height//2+10, :] = 0.8
+    def __init__(self, N=SIM_GRID_SIZE, use_sor=True):
+        self.N = N
+        self.size = N + 2  # 1-cell border padding on each side
+        self.use_sor = use_sor
 
-    def seed_rain(self):
-        # Continuous rain handled in update
-        pass
+        # --- Allocate GPU memory (numba.cuda device arrays) ---
 
-    def update(self):
-        # 1. Add Random Rain (continuous interaction)
-        if cp.random.random() < RAIN_RATE:
-            rx = cp.random.randint(0, self.width)
-            ry = cp.random.randint(0, self.height)
-            self.h_map[ry, rx] += 0.5
-        
-        # 2. Compute Gradients (Slopes)
-        # Using roll to look at neighbors efficiently
-        h_left = cp.roll(self.h_map, 1, axis=1)
-        h_right = cp.roll(self.h_map, -1, axis=1)
-        h_up = cp.roll(self.h_map, 1, axis=0)
-        h_down = cp.roll(self.h_map, -1, axis=0)
+        # Velocity (scalar 2D)
+        self.u  = cuda.device_array((self.size, self.size), dtype=np.float32)
+        self.v  = cuda.device_array((self.size, self.size), dtype=np.float32)
+        self.u0 = cuda.device_array_like(self.u)
+        self.v0 = cuda.device_array_like(self.v)
 
-        # 3. Update Velocity (Shallow Water Equations)
-        # Flow from high to low
-        self.u -= SPEED_OF_WAVE * (h_right - h_left) / 2.0
-        self.v -= SPEED_OF_WAVE * (h_down - h_up) / 2.0
-        
-        # 4. Update Height based on Velocity divergence
-        # If water flows out, height drops. If flows in, height rises.
-        u_diff = (cp.roll(self.u, -1, axis=1) - cp.roll(self.u, 1, axis=1)) / 2.0
-        v_diff = (cp.roll(self.v, -1, axis=0) - cp.roll(self.v, 1, axis=0)) / 2.0
-        
-        self.h_map += (u_diff + v_diff)
+        # Density (RGB 3D)
+        self.d  = cuda.device_array((self.size, self.size, 3), dtype=np.float32)
+        self.d0 = cuda.device_array_like(self.d)
 
-        # 5. Damping (Viscosity)
-        self.h_map *= DAMPING
-        self.u *= DAMPING
-        self.v *= DAMPING
-        
-        # Clamp to prevent explosion
-        self.h_map = cp.clip(self.h_map, 0, 2.0)
+        # Pressure solver
+        self.p     = cuda.device_array_like(self.u)
+        self.p_new = cuda.device_array_like(self.u)   # PRE-ALLOCATED (was per-frame)
+        self.div   = cuda.device_array_like(self.u)
 
-    def render(self):
+        # Vorticity
+        self.curl = cuda.device_array_like(self.u)
+
+        # Output image buffer  (N x N x 3, uint8)
+        self.output = cuda.device_array((N, N, 3), dtype=np.uint8)
+
+        # --- Kernel launch config ---
+        self.tpb = (16, 16)
+        self.bpg = ((self.size + 15) // 16, (self.size + 15) // 16)
+        self.bpg_render = ((N + 15) // 16, (N + 15) // 16)
+
+        # --- Warm up CUDA context (JIT compile kernels) ---
+        self._compile_warmup()
+
+    # ------------------------------------------------------------------
+    #  One-time JIT compilation  (avoids stutter on first real frame)
+    # ------------------------------------------------------------------
+    def _compile_warmup(self):
+        """Run a tiny step to trigger numba CUDA JIT compilation."""
+        tmp = cuda.device_array((self.size, self.size), dtype=np.float32)
+        kernels.k_fill[self.bpg, self.tpb](tmp, 0.0)
+        cuda.synchronize()
+
+    # ------------------------------------------------------------------
+    #  Simulation step
+    # ------------------------------------------------------------------
+    def step(self, dt):
+        # 1. Vorticity confinement (re-injects rotational energy)
+        self._vorticity(dt)
+
+        # 2. Velocity advection  (u -> u0,  v -> v0)
+        kernels.k_advect[self.bpg, self.tpb](
+            self.N, self.u0, self.u, self.u, self.v, dt, VELOCITY_DISSIPATION
+        )
+        kernels.k_advect[self.bpg, self.tpb](
+            self.N, self.v0, self.v, self.u, self.v, dt, VELOCITY_DISSIPATION
+        )
+        # Swap current / previous
+        self.u, self.u0 = self.u0, self.u
+        self.v, self.v0 = self.v0, self.v
+
+        kernels.k_set_boundary[self.bpg, self.tpb](self.N, 1, self.u)
+        kernels.k_set_boundary[self.bpg, self.tpb](self.N, 2, self.v)
+
+        # 3. Pressure projection (divergence-free)
+        self._project()
+
+        # 4. Density advection  (d -> d0)
+        kernels.k_advect_rgb[self.bpg, self.tpb](
+            self.N, self.d0, self.d, self.u, self.v, dt, DISSIPATION
+        )
+        self.d, self.d0 = self.d0, self.d
+
+        kernels.k_set_boundary_rgb[self.bpg, self.tpb](self.N, self.d)
+
+        # Clear the "previous" density buffer for next frame's sources
+        kernels.k_fill[self.bpg, self.tpb](self.d0, 0.0)
+
+    # ------------------------------------------------------------------
+    #  Pressure projection  (SOR or Jacobi)
+    # ------------------------------------------------------------------
+    def _project(self):
+        kernels.k_divergence[self.bpg, self.tpb](
+            self.N, self.u, self.v, self.div, self.p
+        )
+
+        if self.use_sor:
+            pressure_kernel = kernels.k_pressure_sor
+            for _ in range(ITERATIONS):
+                pressure_kernel[self.bpg, self.tpb](
+                    self.N, self.p, self.div, self.p_new, SOR_OMEGA
+                )
+                # Swap pressure buffers
+                self.p, self.p_new = self.p_new, self.p
+        else:
+            for _ in range(ITERATIONS):
+                kernels.k_pressure_jacobi[self.bpg, self.tpb](
+                    self.N, self.p, self.div, self.p_new
+                )
+                self.p, self.p_new = self.p_new, self.p
+
+        kernels.k_gradient_subtract[self.bpg, self.tpb](
+            self.N, self.u, self.v, self.p, self.u0, self.v0
+        )
+        self.u[:] = self.u0
+        self.v[:] = self.v0
+
+        kernels.k_set_boundary[self.bpg, self.tpb](self.N, 1, self.u)
+        kernels.k_set_boundary[self.bpg, self.tpb](self.N, 2, self.v)
+
+    # ------------------------------------------------------------------
+    #  Vorticity confinement
+    # ------------------------------------------------------------------
+    def _vorticity(self, dt):
+        kernels.k_vorticity_compute[self.bpg, self.tpb](
+            self.N, self.u, self.v, self.curl
+        )
+        kernels.k_vorticity_apply[self.bpg, self.tpb](
+            self.N, self.u, self.v, self.curl, dt, VORTICITY_STRENGTH
+        )
+
+    # ------------------------------------------------------------------
+    #  Source injection (autonomous presets & mouse)
+    # ------------------------------------------------------------------
+    def add_source(self, x, y, amount, radius, vel_x, vel_y, color):
+        """Inject RGB density + velocity at grid position (x, y)."""
+        r, g, b = color
+        kernels.k_add_source_rgb[self.bpg, self.tpb](
+            self.N, self.d, self.u, self.v,
+            float(x), float(y), float(radius),
+            float(amount), float(vel_x), float(vel_y),
+            float(r), float(g), float(b),
+        )
+
+    def add_mouse_source(self, gx, gy, prev_gx, prev_gy, color=None):
+        """Inject fluid from mouse drag between two grid positions.
+
+        Derives velocity from cursor movement for intuitive interaction.
         """
-        Renders the height map with simple lighting.
-        """
-        # 1. Calculate Surface Normals for Lighting
-        # Approximate gradient (slope)
-        dx = cp.roll(self.h_map, -1, axis=1) - cp.roll(self.h_map, 1, axis=1)
-        dy = cp.roll(self.h_map, -1, axis=0) - cp.roll(self.h_map, 1, axis=0)
-        
-        # Simple fake shading: 
-        # If facing 'right' and 'up' (light source top-right), it's brighter.
-        # dx positive = slope facing right = light hits it
-        shade = (dx * 0.5) + (dy * 0.5) + 0.5
-        
-        # 2. Combine Height and Shade for final value
-        # We use height for the color base, shade for brightness
-        brightness = self.h_map + shade * 0.5
-        
-        # Normalize to 0-255 for LUT
-        indices = cp.clip(brightness * 128, 0, 255).astype(cp.uint8)
-        
-        # 3. Map to Colors
-        rgb_gpu = self.lut[indices]
-        
-        # 4. Move to CPU
-        return cp.asnumpy(rgb_gpu)
+        if color is None:
+            color = MOUSE_COLOR
+        vx = (gx - prev_gx) * MOUSE_FORCE
+        vy = (gy - prev_gy) * MOUSE_FORCE
+        # Ensure some minimum force so still clicks also produce movement
+        speed = (vx * vx + vy * vy) ** 0.5
+        if speed < 1.0:
+            angle = ((gx + gy) * 0.1) % 6.2832
+            vx = math.cos(angle) * MOUSE_FORCE * 2.0
+            vy = math.sin(angle) * MOUSE_FORCE * 2.0
+        self.add_source(
+            gx, gy, MOUSE_DENSITY, MOUSE_RADIUS,
+            vx, vy, color,
+        )
+
+    # ------------------------------------------------------------------
+    #  Render to image
+    # ------------------------------------------------------------------
+    def render(self, sim_time, mode_idx):
+        """Return (N, N, 3) uint8 numpy array."""
+        kernels.k_render[self.bpg_render, self.tpb](
+            self.N, self.d, self.u, self.v, self.output, sim_time, mode_idx
+        )
+        return self.output.copy_to_host()
+
+    # ------------------------------------------------------------------
+    #  Reset
+    # ------------------------------------------------------------------
+    def reset(self):
+        for arr in (self.u, self.v, self.u0, self.v0):
+            kernels.k_fill[self.bpg, self.tpb](arr, 0.0)
+        for arr in (self.d, self.d0):
+            kernels.k_fill[self.bpg, self.tpb](arr, 0.0)
+
+
